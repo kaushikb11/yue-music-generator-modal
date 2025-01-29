@@ -1,7 +1,6 @@
 import copy
 import os
 import re
-import uuid
 from collections import Counter
 from dataclasses import dataclass
 
@@ -120,7 +119,7 @@ image = (
 
 @app.cls(
     image=image,
-    gpu="A100",
+    gpu="H100",
     volumes={VOLUME_PATH: volume},
     timeout=1800,
 )
@@ -143,6 +142,7 @@ class YuEGenerator:
         sys.path.append("xcodec_mini_infer")
 
         from models.soundstream_hubert_new import SoundStream
+        from vocoder import build_codec_model, process_audio
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -184,6 +184,12 @@ class YuEGenerator:
         )
         self.codec_model.load_state_dict(parameter_dict["codec_model"])
         self.codec_model.eval()
+
+        self.vocal_decoder, self.inst_decoder = build_codec_model(
+            "./xcodec_mini_infer/decoders/config.yaml",
+            "./xcodec_mini_infer/decoders/decoder_131000.pth",
+            "./xcodec_mini_infer/decoders/decoder_151000.pth",
+        )
 
     def _split_lyrics(self, lyrics):
         pattern = r"\[(\w+)\](.*?)\n(?=\[|\Z)"
@@ -344,6 +350,32 @@ class YuEGenerator:
 
         return fixed_output
 
+    def process_audio(self, compressed_array, rescale, decoder, soundstream):
+        import numpy as np
+        import torch
+
+        compressed = compressed_array.astype(np.int16)
+        print(f"Compressed shape: {compressed.shape}")
+
+        compressed = torch.as_tensor(compressed, dtype=torch.long).unsqueeze(1)
+        compressed = soundstream.get_embed(compressed.to(self.device))
+        compressed = torch.tensor(compressed).to(self.device)
+
+        with torch.no_grad():
+            decoder.eval()
+            decoder = decoder.to(self.device)
+            out = decoder(compressed)
+            out = out.detach()
+
+        if rescale:
+            limit = 0.99
+            max_val = out.abs().max()
+            out = out * min(limit / max_val, 1)
+        else:
+            out = out.clamp(-0.99, 0.99)
+
+        return out
+
     @modal.method()
     def generate(
         self,
@@ -357,6 +389,7 @@ class YuEGenerator:
         import torch
         from einops import rearrange
         from transformers import LogitsProcessor, LogitsProcessorList
+        from vocoder import process_audio
 
         genres = genre_txt.strip()
         lyrics = self._split_lyrics(lyrics_txt)
@@ -512,41 +545,32 @@ class YuEGenerator:
 
         print("Generating final audio...")
 
-        # Generate final audio
+        # First decode with codec_model to 16kHz
         with torch.no_grad():
             # Generate vocals
-            vocals_wav = (
-                self.codec_model.decode(
-                    torch.as_tensor(vocals_stage2, dtype=torch.long)
-                    .unsqueeze(0)
-                    .permute(1, 0, 2)
-                    .to(self.device)
-                )
-                .cpu()
-                .numpy()
+            vocals_wav = self.codec_model.decode(
+                torch.as_tensor(vocals_stage2, dtype=torch.long)
+                .unsqueeze(0)
+                .permute(1, 0, 2)
+                .to(self.device)
             )
+            vocals_wav = vocals_wav.cpu()
 
             # Generate instrumentals
-            instrumentals_wav = (
-                self.codec_model.decode(
-                    torch.as_tensor(instrumentals_stage2, dtype=torch.long)
-                    .unsqueeze(0)
-                    .permute(1, 0, 2)
-                    .to(self.device)
-                )
-                .cpu()
-                .numpy()
+            instrumentals_wav = self.codec_model.decode(
+                torch.as_tensor(instrumentals_stage2, dtype=torch.long)
+                .unsqueeze(0)
+                .permute(1, 0, 2)
+                .to(self.device)
             )
-
-        # Mix tracks
-        mixed_wav = vocals_wav + instrumentals_wav
+            instrumentals_wav = instrumentals_wav.cpu()
 
         print("Generation complete!")
 
         return {
-            "vocals": vocals_wav,
-            "instrumentals": instrumentals_wav,
-            "mixed": mixed_wav,
+            "vocals": vocals_wav.cpu().numpy(),
+            "instrumentals": instrumentals_wav.cpu().numpy(),
+            "mixed": (vocals_wav + instrumentals_wav).cpu().numpy(),
         }
 
 
@@ -562,16 +586,132 @@ def main():
     outputs = generator.generate.remote(
         genre_txt=genre_txt,
         lyrics_txt=lyrics_txt,
-        max_new_tokens=1000,
+        max_new_tokens=3000,
         run_n_segments=1,
         stage2_batch_size=4,
     )
 
-    output_dir = "output"
+    output_dir = "output_v1"
     os.makedirs(output_dir, exist_ok=True)
 
     import soundfile as sf
 
-    sf.write(f"{output_dir}/vocals.wav", outputs["vocals"], 16000)
-    sf.write(f"{output_dir}/instrumentals.wav", outputs["instrumentals"], 16000)
-    sf.write(f"{output_dir}/mixed.wav", outputs["mixed"], 16000)
+    vocals = outputs["vocals"].squeeze()
+    instrumentals = outputs["instrumentals"].squeeze()
+    mixed = outputs["mixed"].squeeze()
+
+    sf.write(f"{output_dir}/vocals.wav", vocals, 16000)
+    sf.write(f"{output_dir}/instrumentals.wav", instrumentals, 16000)
+    sf.write(f"{output_dir}/mixed.wav", mixed, 16000)
+
+
+@app.function(
+    image=modal.Image.debian_slim().pip_install("gradio", "fastapi"),
+    concurrency_limit=1,
+    allow_concurrent_inputs=1000,
+)
+@modal.asgi_app()
+def gradio_app():
+    import gradio as gr
+    from fastapi import FastAPI
+    from gradio.routes import mount_gradio_app
+
+    web_app = FastAPI()
+
+    generator = YuEGenerator()
+
+    def generate_song(genre, lyrics, max_tokens=3000, num_segments=2):
+        """Wrapper function for generation that handles audio output"""
+        outputs = generator.generate.remote(
+            genre_txt=genre,
+            lyrics_txt=lyrics,
+            max_new_tokens=max_tokens,
+            run_n_segments=num_segments,
+        )
+
+        return {
+            "vocals": (16000, outputs["vocals_16k"].squeeze()),
+            "instrumentals": (16000, outputs["instrumentals_16k"].squeeze()),
+            "mixed": (16000, outputs["mixed_16k"].squeeze()),
+        }
+
+    with gr.Blocks(title="YuE Lyrics-to-Song Generator") as interface:
+        gr.Markdown(
+            """
+            # 🎵 YuE Lyrics-to-Song Generator
+            Generate music from lyrics using YuE's AI model. Simply provide your genre preferences and lyrics!
+
+            ### Format your lyrics like this:
+            ```
+            [verse]
+            Your verse lyrics here
+
+            [chorus]
+            Your chorus lyrics here
+            ```
+            """
+        )
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                # Input components
+                genre = gr.Textbox(
+                    label="Genre & Style",
+                    placeholder="e.g. inspiring female uplifting pop airy vocal electronic bright vocal",
+                    lines=2,
+                )
+
+                lyrics = gr.Textbox(
+                    label="Lyrics",
+                    placeholder="Enter your lyrics with [verse], [chorus], etc. markers",
+                    lines=15,
+                )
+
+                with gr.Row():
+                    max_tokens = gr.Slider(
+                        label="Max Tokens",
+                        minimum=1000,
+                        maximum=5000,
+                        value=3000,
+                        step=100,
+                    )
+                    num_segments = gr.Slider(
+                        label="Number of Segments",
+                        minimum=1,
+                        maximum=5,
+                        value=2,
+                        step=1,
+                    )
+
+                generate_btn = gr.Button("🎵 Generate Music", variant="primary")
+
+            with gr.Column(scale=1):
+                # Output components
+                with gr.Tab("Mixed"):
+                    mixed_audio = gr.Audio(label="Mixed Track", type="numpy")
+                with gr.Tab("Separate Tracks"):
+                    vocals = gr.Audio(label="Vocals", type="numpy")
+                    instrumentals = gr.Audio(label="Instrumentals", type="numpy")
+
+        gr.Examples(
+            examples=[
+                [
+                    "inspiring female uplifting pop airy vocal electronic bright vocal",
+                    """[verse]
+Staring at the sunset, colors paint the sky
+Thoughts of you keep swirling, can't deny
+...""",
+                ]
+            ],
+            inputs=[genre, lyrics],
+            label="Example Inputs",
+        )
+
+        # Connect components
+        generate_btn.click(
+            fn=generate_song,
+            inputs=[genre, lyrics, max_tokens, num_segments],
+            outputs=[mixed_audio, vocals, instrumentals],
+        )
+
+    return mount_gradio_app(app=web_app, blocks=interface, path="/")
